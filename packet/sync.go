@@ -57,7 +57,7 @@ func (d *SyncPacket) UnmarshalBinary(b []byte) error {
 	// Framing layer
 	d.FrameLength = binary.BigEndian.Uint16(b[38:40])
 	if d.FrameLength&0x0FFF > uint16(len(b)) {
-		return errors.New(fmt.Sprintf("Incorrect packet size %d != %d", d.FrameLength&0x0FFF, len(b)))
+		return fmt.Errorf("Incorrect packet size %d != %d", d.FrameLength&0x0FFF, len(b))
 	}
 	d.FrameVector = binary.BigEndian.Uint32(b[40:44])
 	d.Sequence = b[44]

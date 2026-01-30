@@ -162,7 +162,7 @@ func (d *DataPacket) UnmarshalBinary(b []byte) error {
 	// Framing layer
 	d.FrameLength = binary.BigEndian.Uint16(b[38:40])
 	if d.FrameLength&0x0FFF > uint16(len(b)-38) {
-		return errors.New(fmt.Sprintf("Incorrect packet size %d != %d", d.FrameLength&0x0FFF, len(b)-38))
+		return fmt.Errorf("Incorrect packet size %d != %d", d.FrameLength&0x0FFF, len(b)-38)
 	}
 	d.FrameVector = binary.BigEndian.Uint32(b[40:44])
 	copy(d.SourceName[:], b[44:108])
@@ -175,7 +175,7 @@ func (d *DataPacket) UnmarshalBinary(b []byte) error {
 	// DMP Layer
 	d.DMPLength = binary.BigEndian.Uint16(b[115:117])
 	if d.DMPLength&0x0FFF > uint16(len(b)-115) {
-		return errors.New(fmt.Sprintf("Incorrect packet size %d != %d", d.DMPLength&0x0FFF, len(b)-115))
+		return fmt.Errorf("Incorrect packet size %d != %d", d.DMPLength&0x0FFF, len(b)-115)
 	}
 	d.DMPVector = b[117]
 	d.Format = b[118]
@@ -183,7 +183,7 @@ func (d *DataPacket) UnmarshalBinary(b []byte) error {
 	d.AddressIncrement = binary.BigEndian.Uint16(b[121:123])
 	d.Length = binary.BigEndian.Uint16(b[123:125])
 	if d.Length&0x0FFF > uint16(len(b)-125) {
-		return errors.New(fmt.Sprintf("Incorrect packet size %d != %d", d.Length&0x0FFF, len(b)-126))
+		return fmt.Errorf("Incorrect packet size %d != %d", d.Length&0x0FFF, len(b)-126)
 	}
 	copy(d.Data[:], b[125:])
 

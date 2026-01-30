@@ -226,7 +226,7 @@ func (s *Sender) sendDiscoveryLoop() {
 		number:    DISCOVERY_UNIVERSE,
 		enabled:   true,
 		multicast: true,
-		dataCh:    make(chan packet.SACNPacket, 0), // still create a data channel to close on sender Close()
+		dataCh:    make(chan packet.SACNPacket), // still create a data channel to close on sender Close()
 	}
 	s.wg.Add(1)
 	timer := time.NewTicker(UNIVERSE_DISCOVERY_INTERVAL * time.Second)

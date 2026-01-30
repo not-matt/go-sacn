@@ -1,12 +1,12 @@
 package sacn
 
 import (
-	"errors"
 	"fmt"
-	"golang.org/x/net/ipv4"
 	"log"
 	"net"
 	"time"
+
+	"golang.org/x/net/ipv4"
 
 	"github.com/libp2p/go-reuseport"
 	"gitlab.com/patopest/go-sacn/packet"
@@ -96,11 +96,11 @@ func (r *Receiver) Stop() {
 // Joins the multicast group associated with the universe number.
 func (r *Receiver) JoinUniverse(universe uint16) error {
 	if universe == 0 || (universe > 64000 && universe != DISCOVERY_UNIVERSE) { // Section 9.1.1 of ANSI E1.31—2018
-		return errors.New(fmt.Sprintf("Invalid universe number: %d\n", universe))
+		return fmt.Errorf("Invalid universe number: %d\n", universe)
 	}
 	err := r.conn.JoinGroup(r.itf, universeToAddress(universe))
 	if err != nil {
-		return errors.New(fmt.Sprintf("Could not join multicast group for universe %v: %v", universe, err))
+		return fmt.Errorf("Could not join multicast group for universe %v: %v", universe, err)
 	}
 	return nil
 }
@@ -110,7 +110,7 @@ func (r *Receiver) JoinUniverse(universe uint16) error {
 func (r *Receiver) LeaveUniverse(universe uint16) error {
 	err := r.conn.LeaveGroup(r.itf, universeToAddress(universe))
 	if err != nil {
-		return errors.New(fmt.Sprintf("Could not leave multicast group for universe %v: %v", universe, err))
+		return fmt.Errorf("Could not leave multicast group for universe %v: %v", universe, err)
 	}
 	return nil
 }
@@ -142,7 +142,7 @@ func (r *Receiver) recvLoop() {
 
 			err := r.conn.SetDeadline(time.Now().Add(time.Millisecond * NETWORK_DATA_LOSS_TIMEOUT))
 			if err != nil {
-				log.Panic(fmt.Sprintf("Could not set deadline on socket: %v", err))
+				log.Panicf("Could not set deadline on socket: %v", err)
 				return
 			}
 
