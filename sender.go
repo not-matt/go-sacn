@@ -20,6 +20,7 @@ type Sender struct {
 	discovery *senderUniverse
 	wg        sync.WaitGroup
 	logger    *log.Logger
+	mu        sync.RWMutex
 
 	// common options for packets
 	cid        [16]byte
@@ -33,17 +34,20 @@ type SenderOptions struct {
 	CID        [16]byte    // the CID (Component Identifier): a RFC4122 compliant UUID.
 	SourceName string      // A source name (must not be longer than 64 characters)
 	Logger     *log.Logger // Optionally use an alternative logger instead of the default.
-	// KeepAlive  time.Duration
 }
 
 // Stores all the information required per universe a sender is handling
 type senderUniverse struct {
 	number       uint16
 	dataCh       chan packet.SACNPacket
+	done         chan struct{}
 	enabled      bool
 	sequence     uint8
 	multicast    bool
 	destinations []net.UDPAddr
+	mu           sync.RWMutex
+	closeOnce    sync.Once
+	sendMu       sync.Mutex
 }
 
 var universeNotFoundError = errors.New("Universe is not initialised, please use StartUniverse() first")
@@ -92,6 +96,13 @@ func NewSender(address string, options *SenderOptions) (*Sender, error) {
 		logger:     options.Logger,
 		// keepAlive:  options.KeepAlive,
 	}
+	s.discovery = &senderUniverse{
+		number:    DISCOVERY_UNIVERSE,
+		enabled:   true,
+		multicast: true,
+		dataCh:    make(chan packet.SACNPacket, 3),
+		done:      make(chan struct{}),
+	}
 
 	go s.sendDiscoveryLoop()
 
@@ -100,14 +111,32 @@ func NewSender(address string, options *SenderOptions) (*Sender, error) {
 
 // Stops the sender and all initialised universes
 func (s *Sender) Close() {
-
+	s.mu.Lock()
+	// Copy universe list to avoid races while closing
+	universes := make([]*senderUniverse, 0, len(s.universes))
 	for _, uni := range s.universes {
-		if uni.enabled {
-			close(uni.dataCh)
-		}
+		universes = append(universes, uni)
 	}
-	close(s.discovery.dataCh)
+	discovery := s.discovery
+	s.mu.Unlock()
+
+	// Close all universes and discovery without holding the lock
+	for _, uni := range universes {
+		uni.close()
+	}
+	if discovery != nil {
+		discovery.close()
+	}
+
+	// Wait for all goroutines to finish
 	s.wg.Wait()
+
+	// Now clear the map and close the connection
+	s.mu.Lock()
+	s.universes = make(map[uint16]*senderUniverse)
+	s.discovery = nil
+	s.mu.Unlock()
+
 	defer s.conn.Close()
 }
 
@@ -115,23 +144,33 @@ func (s *Sender) Close() {
 // It returns a channel into which [packet.SACNPacket] can be written to for sending out on the network.
 // Optionally you can use [Sender.Send] to also send packets for a universe.
 func (s *Sender) StartUniverse(universe uint16) (chan<- packet.SACNPacket, error) {
-	if s.IsEnabled(universe) == true {
-		return nil, errors.New("Universe is already enabled")
+	s.mu.Lock()
+	if uni, exists := s.universes[universe]; exists {
+		uni.mu.RLock()
+		enabled := uni.enabled
+		uni.mu.RUnlock()
+		if enabled {
+			s.mu.Unlock()
+			return nil, errors.New("Universe is already enabled")
+		}
 	}
 	if universe < 1 || universe >= 64000 { // From ANSI E1.31-2019 Section 6.2.7
+		s.mu.Unlock()
 		return nil, errors.New("Universe value is incorrect, should be between 1 and 63999")
 	}
 
-	ch := make(chan packet.SACNPacket, 3)
+	ch := make(chan packet.SACNPacket, 10)
 	uni := &senderUniverse{
 		number:       universe,
 		enabled:      true,
 		dataCh:       ch,
+		done:         make(chan struct{}),
 		sequence:     0,
 		multicast:    false,
 		destinations: make([]net.UDPAddr, 0),
 	}
 	s.universes[universe] = uni
+	s.mu.Unlock()
 
 	go s.sendLoop(universe)
 
@@ -142,10 +181,11 @@ func (s *Sender) StartUniverse(universe uint16) (chan<- packet.SACNPacket, error
 // This closes the channel returned to by [Sender.StartUniverse].
 // On closing, 3 [packet.DataPacket] will be sent out with the StreamTerminated bit set as specified in section 6.7.1 of ANSI E1.31—2018.
 func (s *Sender) StopUniverse(universe uint16) error {
-
+	s.mu.RLock()
 	uni, exists := s.universes[universe]
+	s.mu.RUnlock()
 	if exists {
-		close(uni.dataCh)
+		uni.close()
 		return nil
 	}
 	return universeNotFoundError
@@ -154,8 +194,17 @@ func (s *Sender) StopUniverse(universe uint16) error {
 // Send a packet on a universe.
 // This is an alternative way to writing packets directly on the channel returned by [Sender.StartUniverse]
 func (s *Sender) Send(universe uint16, p packet.SACNPacket) error {
+	s.mu.RLock()
 	uni, exists := s.universes[universe]
+	s.mu.RUnlock()
 	if exists {
+		uni.sendMu.Lock()
+		defer uni.sendMu.Unlock()
+		select {
+		case <-uni.done:
+			return errors.New("Universe is closed")
+		default:
+		}
 		uni.dataCh <- p
 		return nil
 	}
@@ -163,15 +212,21 @@ func (s *Sender) Send(universe uint16, p packet.SACNPacket) error {
 }
 
 func (s *Sender) sendLoop(universe uint16) {
-
+	s.mu.RLock()
 	uni := s.universes[universe]
+	s.mu.RUnlock()
+	if uni == nil {
+		return
+	}
 	s.wg.Add(1)
 	ch := uni.dataCh
 
 	// Receive new packets to send out
 	for p := range ch {
+		uni.mu.Lock()
 		uni.sequence += 1
 		sequence := uni.sequence
+		uni.mu.Unlock()
 
 		packetType := p.GetType()
 		switch packetType {
@@ -207,7 +262,9 @@ func (s *Sender) sendLoop(universe uint16) {
 		s.sendPacket(uni, p)
 	}
 
+	uni.mu.Lock()
 	uni.enabled = false
+	uni.mu.Unlock()
 	// Send packet with stream terminated bit 3 times
 	p := packet.NewDataPacket()
 	p.SetStreamTerminated(true)
@@ -217,28 +274,39 @@ func (s *Sender) sendLoop(universe uint16) {
 
 	// Destroy universe
 	s.wg.Done()
+	s.mu.Lock()
 	delete(s.universes, universe)
+	s.mu.Unlock()
 }
 
 func (s *Sender) sendDiscoveryLoop() {
-
-	s.discovery = &senderUniverse{
-		number:    DISCOVERY_UNIVERSE,
-		enabled:   true,
-		multicast: true,
-		dataCh:    make(chan packet.SACNPacket), // still create a data channel to close on sender Close()
-	}
 	s.wg.Add(1)
 	timer := time.NewTicker(UNIVERSE_DISCOVERY_INTERVAL * time.Second)
 	defer timer.Stop()
 	defer s.wg.Done()
 
 	for {
+		s.mu.RLock()
+		discovery := s.discovery
+		s.mu.RUnlock()
+
+		if discovery == nil {
+			return
+		}
+
 		select {
-		case <-s.discovery.dataCh: // channel was closed
+		case <-discovery.done: // discovery was closed
 			return
 		case <-timer.C:
+			s.mu.RLock()
 			num := len(s.universes)
+			discovery := s.discovery
+			s.mu.RUnlock()
+
+			if discovery == nil {
+				return // Already closed
+			}
+
 			pages := num / 512
 			universes := s.GetUniverses()
 			for page := 0; page < pages+1; page += 1 {
@@ -255,7 +323,7 @@ func (s *Sender) sendDiscoveryLoop() {
 				}
 				p.SetUniverses(universes[start:end])
 
-				s.sendPacket(s.discovery, p)
+				s.sendPacket(discovery, p)
 			}
 		}
 	}
@@ -269,15 +337,22 @@ func (s *Sender) sendPacket(universe *senderUniverse, p packet.SACNPacket) {
 		return
 	}
 
+	// snapshot multicast and destinations under lock
+	universe.mu.RLock()
+	multicast := universe.multicast
+	dests := make([]net.UDPAddr, len(universe.destinations))
+	copy(dests, universe.destinations)
+	universe.mu.RUnlock()
+
 	// send multicast if enabled
-	if universe.multicast {
+	if multicast {
 		_, err := s.conn.WriteToUDP(bytes, universeToAddress(universe.number))
 		if err != nil {
 			s.logger.Printf("Error sending multicast packet: %v\n", err)
 		}
 	}
 	// send unicast
-	for _, dest := range universe.destinations {
+	for _, dest := range dests {
 		_, err := s.conn.WriteToUDP(bytes, &dest)
 		if err != nil {
 			s.logger.Printf("Error sending unicast packet: %v\n", err)
@@ -288,37 +363,56 @@ func (s *Sender) sendPacket(universe *senderUniverse, p packet.SACNPacket) {
 // GetUniverses returns the list of all currently enabled universes for the sender.
 func (s *Sender) GetUniverses() []uint16 {
 	unis := make([]uint16, 0)
+	s.mu.RLock()
 	for n, uni := range s.universes {
-		if uni.enabled {
+		uni.mu.RLock()
+		enabled := uni.enabled
+		uni.mu.RUnlock()
+		if enabled {
 			unis = append(unis, n)
 		}
 	}
+	s.mu.RUnlock()
 	return unis
 }
 
 // IsEnabled returns true if the universe is currently enabled.
 func (s *Sender) IsEnabled(universe uint16) bool {
+	s.mu.RLock()
 	uni, exists := s.universes[universe]
-	if exists && uni.enabled {
-		return true
+	s.mu.RUnlock()
+	if !exists {
+		return false
 	}
-	return false
+	uni.mu.RLock()
+	enabled := uni.enabled
+	uni.mu.RUnlock()
+	return enabled
 }
 
 // IsMulticast returns wether or not multicast is turned on for the given universe.
 func (s *Sender) IsMulticast(universe uint16) (bool, error) {
+	s.mu.RLock()
 	uni, exists := s.universes[universe]
+	s.mu.RUnlock()
 	if exists {
-		return uni.multicast, nil
+		uni.mu.RLock()
+		multicast := uni.multicast
+		uni.mu.RUnlock()
+		return multicast, nil
 	}
 	return false, universeNotFoundError
 }
 
 // SetMulticast is for setting whether or not a universe should be send out via multicast.
 func (s *Sender) SetMulticast(universe uint16, multicast bool) error {
+	s.mu.RLock()
 	uni, exists := s.universes[universe]
+	s.mu.RUnlock()
 	if exists {
+		uni.mu.Lock()
 		uni.multicast = multicast
+		uni.mu.Unlock()
 		return nil
 	}
 	return universeNotFoundError
@@ -327,9 +421,15 @@ func (s *Sender) SetMulticast(universe uint16, multicast bool) error {
 // GetDestinations returns the list of unicast destinations the universe is configured to send it's packets to.
 func (s *Sender) GetDestinations(universe uint16) ([]string, error) {
 	dests := make([]string, 0)
+	s.mu.RLock()
 	uni, exists := s.universes[universe]
+	s.mu.RUnlock()
 	if exists {
-		for _, dest := range uni.destinations {
+		uni.mu.RLock()
+		copyDests := make([]net.UDPAddr, len(uni.destinations))
+		copy(copyDests, uni.destinations)
+		uni.mu.RUnlock()
+		for _, dest := range copyDests {
 			dests = append(dests, dest.IP.String())
 		}
 		return dests, nil
@@ -346,9 +446,13 @@ func (s *Sender) AddDestination(universe uint16, destination string) error {
 		return err
 	}
 
+	s.mu.RLock()
 	uni, exists := s.universes[universe]
+	s.mu.RUnlock()
 	if exists {
+		uni.mu.Lock()
 		uni.destinations = append(uni.destinations, *addr)
+		uni.mu.Unlock()
 		return nil
 	}
 	return universeNotFoundError
@@ -367,10 +471,23 @@ func (s *Sender) SetDestinations(universe uint16, destinations []string) error {
 		dests = append(dests, *addr)
 	}
 
+	s.mu.RLock()
 	uni, exists := s.universes[universe]
+	s.mu.RUnlock()
 	if exists {
+		uni.mu.Lock()
 		uni.destinations = dests
+		uni.mu.Unlock()
 		return nil
 	}
 	return universeNotFoundError
+}
+
+func (u *senderUniverse) close() {
+	u.closeOnce.Do(func() {
+		u.sendMu.Lock()
+		close(u.done)
+		close(u.dataCh)
+		u.sendMu.Unlock()
+	})
 }
