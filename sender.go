@@ -21,6 +21,7 @@ type Sender struct {
 	wg        sync.WaitGroup
 	logger    *log.Logger
 	mu        sync.RWMutex
+	closed    bool
 
 	// common options for packets
 	cid        [16]byte
@@ -104,6 +105,7 @@ func NewSender(address string, options *SenderOptions) (*Sender, error) {
 		done:      make(chan struct{}),
 	}
 
+	s.wg.Add(1)
 	go s.sendDiscoveryLoop()
 
 	return s, nil
@@ -112,6 +114,11 @@ func NewSender(address string, options *SenderOptions) (*Sender, error) {
 // Stops the sender and all initialised universes
 func (s *Sender) Close() {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
 	// Copy universe list to avoid races while closing
 	universes := make([]*senderUniverse, 0, len(s.universes))
 	for _, uni := range s.universes {
@@ -145,6 +152,10 @@ func (s *Sender) Close() {
 // Optionally you can use [Sender.Send] to also send packets for a universe.
 func (s *Sender) StartUniverse(universe uint16) (chan<- packet.SACNPacket, error) {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, errors.New("Sender is closed")
+	}
 	if uni, exists := s.universes[universe]; exists {
 		uni.mu.RLock()
 		enabled := uni.enabled
@@ -172,6 +183,7 @@ func (s *Sender) StartUniverse(universe uint16) (chan<- packet.SACNPacket, error
 	s.universes[universe] = uni
 	s.mu.Unlock()
 
+	s.wg.Add(1)
 	go s.sendLoop(universe)
 
 	return ch, nil
@@ -216,9 +228,9 @@ func (s *Sender) sendLoop(universe uint16) {
 	uni := s.universes[universe]
 	s.mu.RUnlock()
 	if uni == nil {
+		s.wg.Done()
 		return
 	}
-	s.wg.Add(1)
 	ch := uni.dataCh
 
 	// Receive new packets to send out
@@ -280,7 +292,6 @@ func (s *Sender) sendLoop(universe uint16) {
 }
 
 func (s *Sender) sendDiscoveryLoop() {
-	s.wg.Add(1)
 	timer := time.NewTicker(UNIVERSE_DISCOVERY_INTERVAL * time.Second)
 	defer timer.Stop()
 	defer s.wg.Done()
